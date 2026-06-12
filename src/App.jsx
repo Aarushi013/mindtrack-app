@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import WelcomeScreen from './components/WelcomeScreen'
 import MoodScreen from './components/MoodScreen'
 import JournalScreen from './components/JournalScreen'
@@ -12,6 +12,9 @@ import AppFooter from './components/AppFooter'
 import { moodThemeByLabel } from './data/moods'
 import './App.css'
 import { supabase } from './supabase'
+import AuthScreen from './components/AuthScreen'
+import DiaryScreen from './components/DiaryScreen'
+import PrivacyScreen from './components/PrivacyScreen'
 
 function App() {
   console.log('Supabase connected:', supabase)                                                 
@@ -19,6 +22,8 @@ function App() {
   const [studentName, setStudentName] = useState('')
   const [selectedMood, setSelectedMood] = useState('')
   const [journalEntry, setJournalEntry] = useState('')
+  const [user, setUser] = useState(null)
+  const [entries, setEntries] = useState([])
   console.log('CURRENT SCREEN:', currentScreen)
 
   const startCheckIn = (name) => {
@@ -34,14 +39,14 @@ function App() {
  const completeJournal = async (entry) => {
   const cleanedEntry = entry.trim()
 
-  const { data, error } = await supabase
-    .from('mood_entries')
-    .insert([
-      {
-        mood: selectedMood,
-        journal_entry: cleanedEntry
-      }
-    ])
+  const payload = {
+    mood: selectedMood,
+    journal_entry: cleanedEntry,
+  }
+
+  if (user?.id) payload.user_id = user.id
+
+  const { data, error } = await supabase.from('mood_entries').insert([payload])
 
   if (error) {
     console.error('Supabase error:', error)
@@ -51,9 +56,27 @@ function App() {
 
   setJournalEntry(cleanedEntry)
   setCurrentScreen('suggestions')
-
+  // refresh entries for insights/history
+  fetchEntries()
   }
 
+
+  const fetchEntries = async () => {
+    if (!user?.id) return
+
+    const { data, error } = await supabase
+      .from('mood_entries')
+      .select('*')
+      .eq('user_id', user.id)
+      .order('created_at', { ascending: false })
+
+    if (error) {
+      console.error('Failed to fetch entries', error)
+      return
+    }
+
+    setEntries(data ?? [])
+  }
   const goToInsights = () => {
     setCurrentScreen('insights')
   }
@@ -61,6 +84,81 @@ function App() {
   const goToWellnessActivity = () => {
     setCurrentScreen('wellness')
   }
+
+  const updateEntry = async (id, updates) => {
+    if (!user?.id) return false
+
+    const { error } = await supabase
+      .from('mood_entries')
+      .update(updates)
+      .eq('id', id)
+      .eq('user_id', user.id)
+
+    if (error) {
+      console.error('Failed to update entry', error)
+      return false
+    }
+
+    await fetchEntries()
+    return true
+  }
+
+  const deleteEntry = async (id) => {
+    if (!user?.id) return false
+
+    const { error } = await supabase
+      .from('mood_entries')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', user.id)
+
+    if (error) {
+      console.error('Failed to delete entry', error)
+      return false
+    }
+
+    await fetchEntries()
+    return true
+  }
+
+  const handleLogout = async () => {
+    await supabase.auth.signOut()
+    setUser(null)
+    setEntries([])
+    setCurrentScreen('auth')
+  }
+
+  // handle auth state
+  useEffect(() => {
+    let mounted = true
+
+    const init = async () => {
+      const {
+        data: { user: currentUser }
+      } = await supabase.auth.getUser()
+
+      if (!mounted) return
+      setUser(currentUser ?? null)
+
+      if (currentUser) {
+        fetchEntries()
+      }
+    }
+
+    init()
+
+    const { data: listener } = supabase.auth.onAuthStateChange((event, session) => {
+      const u = session?.user ?? null
+      setUser(u)
+      if (u) fetchEntries()
+      if (!u) setEntries([])
+    })
+
+    return () => {
+      mounted = false
+      listener?.subscription?.unsubscribe?.()
+    }
+  }, [])
 
   const resetCheckIn = () => {
     setCurrentScreen('welcome')
@@ -82,8 +180,19 @@ function App() {
   const moodThemeClass = moodThemeByLabel[selectedMood] ?? 'theme-neutral'
   const isWelcomeScreen = currentScreen === 'welcome'
   const screenClass = `screen-${currentScreen}`
+  const currentProgressStep = progressSteps[currentScreen] ?? 0
 
   const renderScreen = () => {
+    // Auth screen route
+    if (currentScreen === 'auth') {
+      return <AuthScreen onAuth={(u) => { setUser(u); if (u) setCurrentScreen('welcome') }} />
+    }
+
+    // if user is not signed in, show auth screen
+    if (!user) {
+      return <AuthScreen onAuth={(u) => { setUser(u); if (u) setCurrentScreen('welcome') }} />
+    }
+
     if (currentScreen === 'welcome') {
       return <WelcomeScreen onContinue={startCheckIn} />
     }
@@ -127,9 +236,25 @@ function App() {
         <InsightsScreen
           studentName={studentName}
           selectedMood={selectedMood}
+          entries={entries}
           onContinue={goToWellnessActivity}
         />
       )
+    }
+
+    if (currentScreen === 'diary' || currentScreen === 'history') {
+      return (
+        <DiaryScreen
+          entries={entries}
+          onUpdateEntry={updateEntry}
+          onDeleteEntry={deleteEntry}
+          onReturn={() => setCurrentScreen('welcome')}
+        />
+      )
+    }
+
+    if (currentScreen === 'privacy') {
+      return <PrivacyScreen onClose={() => setCurrentScreen('welcome')} />
     }
 
     return (
@@ -143,7 +268,7 @@ function App() {
       <div className="bg-blob blob-2" aria-hidden="true"></div>
       <div className="bg-blob blob-3" aria-hidden="true"></div>
 
-      <TopNav showActions={isWelcomeScreen} />
+      <TopNav user={user} onLogout={handleLogout} onNavigate={(s) => setCurrentScreen(s)} showActions={isWelcomeScreen} />
 
       <main className="content-wrap">
         <header className="app-header screen-enter">
@@ -151,8 +276,8 @@ function App() {
           <p>Quick daily mental wellbeing check-in for university students.</p>
         </header>
 
-        <ProgressIndicator currentStep={progressSteps[currentScreen]} totalSteps={totalSteps} />
-        <StreakTracker />
+        {currentProgressStep ? <ProgressIndicator currentStep={currentProgressStep} totalSteps={totalSteps} /> : null}
+        <StreakTracker entries={entries} />
 
         {renderScreen()}
       </main>
